@@ -3,14 +3,20 @@
 #include <stdint.h>
 #include <string.h>
 #include <limits.h>
-// liboqs API for post-quantum algorithms, including ML-KEM.
+// liboqs API for post-quantum lattice KEM algorithms, including LKEM.
 #include <oqs/oqs.h>
 // OpenSSL high-level cryptography API for AES-GCM.
 #include <openssl/evp.h>
 // OpenSSL cryptographically secure random-number functions.
 #include <openssl/rand.h>
 
-// AES-256 uses a 32-byte key. ML-KEM-768 produces a shared secret of this size.
+// This program derives the AES-256-GCM key from a real lattice KEM shared
+// secret that is not module-lattice based. FrodoKEM is a non-module lattice KEM
+// available in liboqs, so the LKEM path uses that implementation for comparison.
+#define LKEM_ALG OQS_KEM_alg_frodokem_976_shake
+
+// AES-256 uses a 32-byte key. Some lattice KEMs, such as FrodoKEM-640-SHAKE,
+// produce a shorter shared secret, so we derive the AES key from the KEM secret.
 #define AES_KEY_LEN 32
 // Twelve bytes is the standard IV length for AES-GCM.
 #define GCM_IV_LEN 12
@@ -51,6 +57,14 @@ static int sha256_digest(const uint8_t *data, size_t length,
              digest_length == SHA256_LEN;
     EVP_MD_CTX_free(ctx);
     return ok ? 0 : -1;
+}
+
+// Derive the 32-byte AES key from a KEM shared secret. This keeps the protocol
+// portable across lattice KEMs whose raw shared-secret output is shorter than
+// the AES-256 key length.
+static int derive_aes_key(const uint8_t *kem_secret, size_t kem_secret_len,
+                         uint8_t aes_key[AES_KEY_LEN]) {
+    return sha256_digest(kem_secret, kem_secret_len, aes_key);
 }
 
 // Read an entire binary file into a newly allocated buffer.
@@ -232,8 +246,9 @@ static int packet_layout_valid(size_t packet_len,
     return packet_len == expected_len;
 }
 
-// Encrypt plaintext with AES-256-GCM using the 32-byte ML-KEM shared secret as
-// the AES key. The IV and tag are public values that accompany the ciphertext.
+// Encrypt plaintext with AES-256-GCM using the 32-byte lattice KEM shared
+// secret as the AES key. The IV and tag are public values that accompany the
+// ciphertext.
 static int aes_gcm_encrypt(const uint8_t *key, const uint8_t *iv,
                             const uint8_t *aad, size_t aad_len,
                             const uint8_t *plaintext, size_t plaintext_len,
@@ -348,6 +363,7 @@ static int self_test_authentication(const uint8_t *key,
     uint8_t *decoded = malloc(sizeof(data) - 1);
     uint8_t *tampered_kem_ciphertext = malloc(kem_ciphertext_len);
     uint8_t *tampered_shared_secret = malloc(kem->length_shared_secret);
+    uint8_t tampered_aes_key[AES_KEY_LEN];
     int ciphertext_len;
     int failures = 0;
 
@@ -407,9 +423,13 @@ static int self_test_authentication(const uint8_t *key,
     memcpy(tampered_kem_ciphertext, kem_ciphertext, kem_ciphertext_len);
     tampered_kem_ciphertext[0] ^= 1;
     OQS_KEM_decaps(kem, tampered_shared_secret, tampered_kem_ciphertext, secret_key);
-    failures += report_self_test("modified ML-KEM ciphertext rejected",
-        aes_gcm_decrypt(tampered_shared_secret, iv, aad, sizeof(aad) - 1,
-                        ciphertext, (size_t)ciphertext_len, tag, decoded) < 0);
+    if (derive_aes_key(tampered_shared_secret, kem->length_shared_secret, tampered_aes_key) != 0) {
+        failures += report_self_test("modified LKEM ciphertext rejected", 0);
+    } else {
+        failures += report_self_test("modified LKEM ciphertext rejected",
+            aes_gcm_decrypt(tampered_aes_key, iv, aad, sizeof(aad) - 1,
+                            ciphertext, (size_t)ciphertext_len, tag, decoded) < 0);
+    }
 
     free(ciphertext);
     free(decoded);
@@ -467,7 +487,7 @@ static int self_test_hashes(void) {
 }
 
 static int run_self_tests(void) {
-    OQS_KEM *kem = OQS_KEM_new(OQS_KEM_alg_ml_kem_768);
+    OQS_KEM *lkem = OQS_KEM_new(LKEM_ALG);
     uint8_t *public_key = NULL;
     uint8_t *secret_key = NULL;
     uint8_t *kem_ciphertext = NULL;
@@ -479,16 +499,16 @@ static int run_self_tests(void) {
     int failures = 0;
 
     printf("SELF-TESTS\n==========\n");
-    if (kem == NULL) {
-        fprintf(stderr, "ML-KEM-768 not available\n");
+    if (lkem == NULL) {
+        fprintf(stderr, "LKEM-768 not available\n");
         return 1;
     }
 
-    public_key = malloc(kem->length_public_key);
-    secret_key = malloc(kem->length_secret_key);
-    kem_ciphertext = malloc(kem->length_ciphertext);
-    shared_secret_enc = malloc(kem->length_shared_secret);
-    shared_secret_dec = malloc(kem->length_shared_secret);
+    public_key = malloc(lkem->length_public_key);
+    secret_key = malloc(lkem->length_secret_key);
+    kem_ciphertext = malloc(lkem->length_ciphertext);
+    shared_secret_enc = malloc(lkem->length_shared_secret);
+    shared_secret_dec = malloc(lkem->length_shared_secret);
     large_data = malloc(1024 * 1024);
     for (size_t index = 0; index < sizeof(binary_data); index++) {
         binary_data[index] = (uint8_t)index;
@@ -496,16 +516,16 @@ static int run_self_tests(void) {
 
     if (public_key == NULL || secret_key == NULL || kem_ciphertext == NULL ||
         shared_secret_enc == NULL || shared_secret_dec == NULL || large_data == NULL ||
-        OQS_KEM_keypair(kem, public_key, secret_key) != OQS_SUCCESS ||
-        OQS_KEM_encaps(kem, kem_ciphertext, shared_secret_enc, public_key) != OQS_SUCCESS ||
-        OQS_KEM_decaps(kem, shared_secret_dec, kem_ciphertext, secret_key) != OQS_SUCCESS) {
+        OQS_KEM_keypair(lkem, public_key, secret_key) != OQS_SUCCESS ||
+        OQS_KEM_encaps(lkem, kem_ciphertext, shared_secret_enc, public_key) != OQS_SUCCESS ||
+        OQS_KEM_decaps(lkem, shared_secret_dec, kem_ciphertext, secret_key) != OQS_SUCCESS) {
         fprintf(stderr, "Could not prepare self-tests\n");
         failures = 1;
         goto cleanup;
     }
 
-    failures += report_self_test("ML-KEM shared secrets match",
-        memcmp(shared_secret_enc, shared_secret_dec, kem->length_shared_secret) == 0);
+    failures += report_self_test("LKEM shared secrets match",
+        memcmp(shared_secret_enc, shared_secret_dec, lkem->length_shared_secret) == 0);
     failures += self_test_round_trip("empty input", shared_secret_enc, NULL, 0);
     failures += self_test_round_trip("1-byte input", shared_secret_enc, binary_data, 1);
     failures += self_test_round_trip("16-byte input", shared_secret_enc, binary_data, 16);
@@ -521,9 +541,9 @@ static int run_self_tests(void) {
     }
     failures += self_test_round_trip("1 MiB input", shared_secret_enc,
                                      large_data, 1024 * 1024);
-    failures += self_test_packet_layout(kem->length_ciphertext);
+    failures += self_test_packet_layout(lkem->length_ciphertext);
     failures += self_test_authentication(shared_secret_enc, kem_ciphertext,
-                                         kem->length_ciphertext, kem, secret_key);
+                                         lkem->length_ciphertext, lkem, secret_key);
     failures += self_test_hashes();
 
     uint8_t iv_one[GCM_IV_LEN], iv_two[GCM_IV_LEN];
@@ -559,7 +579,7 @@ cleanup:
     free(shared_secret_enc);
     free(shared_secret_dec);
     free(large_data);
-    OQS_KEM_free(kem);
+    OQS_KEM_free(lkem);
     printf("\nSelf-tests %s (%d failure%s)\n", failures == 0 ? "passed" : "failed",
            failures, failures == 1 ? "" : "s");
     return failures == 0 ? 0 : 1;
@@ -588,23 +608,23 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    // Create an ML-KEM-768 algorithm instance from liboqs.
-    OQS_KEM *kem = OQS_KEM_new(OQS_KEM_alg_ml_kem_768);
-    if (kem == NULL) {
-        fprintf(stderr, "ML-KEM-768 not available\n");
+    // Create an LKEM-768 algorithm instance from liboqs.
+    OQS_KEM *lkem = OQS_KEM_new(LKEM_ALG);
+    if (lkem == NULL) {
+        fprintf(stderr, "LKEM-768 not available\n");
         free(input_data);
         return 1;
     }
 
-    // Allocate buffers using the sizes required by the selected ML-KEM.
-    uint8_t *public_key = malloc(kem->length_public_key);
+    // Allocate buffers using the sizes required by the selected LKEM.
+    uint8_t *public_key = malloc(lkem->length_public_key);
     // The private key must remain secret and is used for decapsulation.
-    uint8_t *secret_key = malloc(kem->length_secret_key);
+    uint8_t *secret_key = malloc(lkem->length_secret_key);
     // This is sent to the receiver so it can recover the shared secret.
-    uint8_t *kem_ciphertext = malloc(kem->length_ciphertext);
-    // Sender-side and receiver-side copies of the same ML-KEM shared secret.
-    uint8_t *shared_secret_enc = malloc(kem->length_shared_secret);
-    uint8_t *shared_secret_dec = malloc(kem->length_shared_secret);
+    uint8_t *kem_ciphertext = malloc(lkem->length_ciphertext);
+    // Sender-side and receiver-side copies of the same LKEM shared secret.
+    uint8_t *shared_secret_enc = malloc(lkem->length_shared_secret);
+    uint8_t *shared_secret_dec = malloc(lkem->length_shared_secret);
     // AES-GCM output and its decryption destination.
     uint8_t *ciphertext = malloc(input_len > 0 ? input_len : 1);
     uint8_t *decrypted = malloc(input_len > 0 ? input_len : 1);
@@ -613,33 +633,42 @@ int main(int argc, char **argv) {
     uint8_t iv[GCM_IV_LEN];
     uint8_t tag[GCM_TAG_LEN];
 
-    // Receiver: generate the long-term ML-KEM public/private key pair.
-    OQS_KEM_keypair(kem, public_key, secret_key);
+    // Receiver: generate the long-term LKEM public/private key pair.
+    OQS_KEM_keypair(lkem, public_key, secret_key);
 
     // Sender: use the receiver's public key to create a KEM ciphertext and a
     // shared secret. Only the KEM ciphertext needs to be sent to the receiver.
-    OQS_KEM_encaps(kem, kem_ciphertext, shared_secret_enc, public_key);
+    OQS_KEM_encaps(lkem, kem_ciphertext, shared_secret_enc, public_key);
+    uint8_t aes_key_enc[AES_KEY_LEN];
+    if (derive_aes_key(shared_secret_enc, lkem->length_shared_secret, aes_key_enc) != 0) {
+        fprintf(stderr, "Could not derive the sender AES key from the LKEM secret\n");
+        free(public_key); free(secret_key); free(kem_ciphertext);
+        free(shared_secret_enc); free(shared_secret_dec);
+        free(ciphertext); free(decrypted); free(input_data);
+        OQS_KEM_free(lkem);
+        return 1;
+    }
     // Generate a fresh random IV for this AES-GCM encryption.
     RAND_bytes(iv, GCM_IV_LEN);
 
     // GCM does not change the payload length, so the header can be authenticated
     // before encryption and then serialized unchanged into the packet.
     packet_header_t header = {
-        .kem_ciphertext_len = (uint32_t)kem->length_ciphertext,
+        .kem_ciphertext_len = (uint32_t)lkem->length_ciphertext,
         .payload_len = (uint32_t)input_len,
     };
-    // Encrypt the input using the sender's ML-KEM-derived AES key.
-    int ct_len = aes_gcm_encrypt(shared_secret_enc, iv,
+    // Encrypt the input using the sender's derived AES key.
+    int ct_len = aes_gcm_encrypt(aes_key_enc, iv,
                                  (const uint8_t *)&header, sizeof(header),
                                  input_data, input_len, ciphertext, tag);
 
     // Assemble the exported packet: a small header followed by the KEM
     // ciphertext, IV, authentication tag, and AES-GCM ciphertext in sequence.
-    size_t packet_len = sizeof(header) + kem->length_ciphertext + GCM_IV_LEN + GCM_TAG_LEN + (size_t)ct_len;
+    size_t packet_len = sizeof(header) + lkem->length_ciphertext + GCM_IV_LEN + GCM_TAG_LEN + (size_t)ct_len;
     uint8_t *packet = malloc(packet_len);
     uint8_t *cursor = packet;
     memcpy(cursor, &header, sizeof(header)); cursor += sizeof(header);
-    memcpy(cursor, kem_ciphertext, kem->length_ciphertext); cursor += kem->length_ciphertext;
+    memcpy(cursor, kem_ciphertext, lkem->length_ciphertext); cursor += lkem->length_ciphertext;
     memcpy(cursor, iv, GCM_IV_LEN); cursor += GCM_IV_LEN;
     memcpy(cursor, tag, GCM_TAG_LEN); cursor += GCM_TAG_LEN;
     memcpy(cursor, ciphertext, (size_t)ct_len);
@@ -649,7 +678,7 @@ int main(int argc, char **argv) {
         free(public_key); free(secret_key); free(kem_ciphertext);
         free(shared_secret_enc); free(shared_secret_dec);
         free(ciphertext); free(decrypted); free(input_data);
-        OQS_KEM_free(kem);
+        OQS_KEM_free(lkem);
         return 1;
     }
     // Also wrap the same encoded packet in a pcapng capture file, so it can
@@ -661,7 +690,7 @@ int main(int argc, char **argv) {
         free(public_key); free(secret_key); free(kem_ciphertext);
         free(shared_secret_enc); free(shared_secret_dec);
         free(ciphertext); free(decrypted); free(input_data);
-        OQS_KEM_free(kem);
+        OQS_KEM_free(lkem);
         return 1;
     }
     if (sha256_digest(packet, packet_len, encoded_hash) != 0) {
@@ -670,7 +699,7 @@ int main(int argc, char **argv) {
         free(public_key); free(secret_key); free(kem_ciphertext);
         free(shared_secret_enc); free(shared_secret_dec);
         free(ciphertext); free(decrypted); free(input_data);
-        OQS_KEM_free(kem);
+        OQS_KEM_free(lkem);
         return 1;
     }
     free(packet);
@@ -687,7 +716,7 @@ int main(int argc, char **argv) {
         packet_header_t read_header;
         memcpy(&read_header, read_packet, sizeof(read_header));
         if (!packet_layout_valid(read_packet_len, &read_header,
-                                 kem->length_ciphertext)) {
+                                 lkem->length_ciphertext)) {
             fprintf(stderr, "Exported packet '%s' is malformed\n", argv[2]);
             status = 1;
         } else {
@@ -696,37 +725,44 @@ int main(int argc, char **argv) {
             const uint8_t *read_iv = rcursor; rcursor += GCM_IV_LEN;
             const uint8_t *read_tag = rcursor; rcursor += GCM_TAG_LEN;
             const uint8_t *read_payload = rcursor;
+            int pt_len = -1;
 
-            // Receiver: use the ML-KEM private key and KEM ciphertext to recover
+            // Receiver: use the LKEM private key and KEM ciphertext to recover
             // the same shared secret independently of the sender.
-            OQS_KEM_decaps(kem, shared_secret_dec, read_kem_ct, secret_key);
-            // Decrypt and authenticate the AES-GCM ciphertext using the recovered key.
-            int pt_len = aes_gcm_decrypt(shared_secret_dec, read_iv,
+            OQS_KEM_decaps(lkem, shared_secret_dec, read_kem_ct, secret_key);
+            uint8_t aes_key_dec[AES_KEY_LEN];
+            if (derive_aes_key(shared_secret_dec, lkem->length_shared_secret, aes_key_dec) != 0) {
+                fprintf(stderr, "Could not derive the receiver AES key from the LKEM secret\n");
+                status = 1;
+            } else {
+                // Decrypt and authenticate the AES-GCM ciphertext using the recovered key.
+                pt_len = aes_gcm_decrypt(aes_key_dec, read_iv,
                                          (const uint8_t *)&read_header, sizeof(read_header),
                                          read_payload, read_header.payload_len,
                                          read_tag, decrypted);
-            if (pt_len < 0) {
-                // A failed tag check means the ciphertext cannot be trusted.
-                fprintf(stderr, "Decryption failed: authentication tag mismatch\n");
-                status = 1;
-            } else if ((size_t)pt_len != input_len || memcmp(input_data, decrypted, input_len) != 0) {
-                // This verifies that the output has the same length and bytes as the input.
-                fprintf(stderr, "Decryption failed: recovered data does not match the input packet\n");
-                status = 1;
-            } else if (write_file(argv[3], decrypted, (size_t)pt_len) != 0) {
-                status = 1;
+                if (pt_len < 0) {
+                    // A failed tag check means the ciphertext cannot be trusted.
+                    fprintf(stderr, "Decryption failed: authentication tag mismatch\n");
+                    status = 1;
+                } else if ((size_t)pt_len != input_len || memcmp(input_data, decrypted, input_len) != 0) {
+                    // This verifies that the output has the same length and bytes as the input.
+                    fprintf(stderr, "Decryption failed: recovered data does not match the input packet\n");
+                    status = 1;
+                } else if (write_file(argv[3], decrypted, (size_t)pt_len) != 0) {
+                    status = 1;
+                }
             }
         }
     }
     free(read_packet);
 
-    printf("\nML-KEM\n======\n");
-    printf("Public key length: %zu bytes\n", kem->length_public_key);
-    printf("Private key length: %zu bytes\n", kem->length_secret_key);
-    printf("Shared secret length: %zu bytes\n\n", kem->length_shared_secret);
-    printf("KEM ciphertext length: %zu bytes\n", kem->length_ciphertext);
+    printf("\nLKEM -> AES-256-GCM\n===================\n");
+    printf("Public key length: %zu bytes\n", lkem->length_public_key);
+    printf("Private key length: %zu bytes\n", lkem->length_secret_key);
+    printf("Shared secret length: %zu bytes\n\n", lkem->length_shared_secret);
+    printf("KEM ciphertext length: %zu bytes\n", lkem->length_ciphertext);
 
-    printf("\nAES-GCM\n=======\n");
+    printf("\nAES-256-GCM\n===========\n");
     printf("AES key length: %d bytes (KEM shared secret)\n", AES_KEY_LEN);
     printf("GHASH subkey length: %d bytes (internal AES-GCM value)\n",
            GCM_GHASH_SUBKEY_LEN);
@@ -750,26 +786,32 @@ int main(int argc, char **argv) {
         free(string_decoded);
         status = 1;
     } else {
-        int string_ciphertext_len = aes_gcm_encrypt(
-            shared_secret_enc, string_iv, NULL, 0,
-            (const uint8_t *)demo_string, demo_string_len,
-            string_ciphertext, string_tag);
-        int string_decoded_len = aes_gcm_decrypt(
-            shared_secret_dec, string_iv, NULL, 0,
-            string_ciphertext, (size_t)string_ciphertext_len,
-            string_tag, string_decoded);
-
-        if (string_decoded_len < 0 || (size_t)string_decoded_len != demo_string_len) {
-            fprintf(stderr, "String decryption failed: authentication tag mismatch\n");
+        uint8_t demo_aes_key[AES_KEY_LEN];
+        if (derive_aes_key(shared_secret_enc, lkem->length_shared_secret, demo_aes_key) != 0) {
+            fprintf(stderr, "Could not derive the demo AES key from the LKEM secret\n");
             status = 1;
         } else {
-            string_decoded[string_decoded_len] = '\0';
-            printf("\nString\n==================\n");
-            printf("Original string:\n%s\n\n", demo_string);
-            print_hex("Encrypted string", string_ciphertext,
-                      (size_t)string_ciphertext_len);
-            putchar('\n');
-            printf("Decoded string:\n%s\n", string_decoded);
+            int string_ciphertext_len = aes_gcm_encrypt(
+                demo_aes_key, string_iv, NULL, 0,
+                (const uint8_t *)demo_string, demo_string_len,
+                string_ciphertext, string_tag);
+            int string_decoded_len = aes_gcm_decrypt(
+                demo_aes_key, string_iv, NULL, 0,
+                string_ciphertext, (size_t)string_ciphertext_len,
+                string_tag, string_decoded);
+
+            if (string_decoded_len < 0 || (size_t)string_decoded_len != demo_string_len) {
+                fprintf(stderr, "String decryption failed: authentication tag mismatch\n");
+                status = 1;
+            } else {
+                string_decoded[string_decoded_len] = '\0';
+                printf("\nString\n==================\n");
+                printf("Original string:\n%s\n\n", demo_string);
+                print_hex("Encrypted string", string_ciphertext,
+                          (size_t)string_ciphertext_len);
+                putchar('\n');
+                printf("Decoded string:\n%s\n", string_decoded);
+            }
         }
     }
     free(string_ciphertext);
@@ -806,6 +848,6 @@ int main(int argc, char **argv) {
     free(ciphertext);
     free(decrypted);
     free(input_data);
-    OQS_KEM_free(kem);
+    OQS_KEM_free(lkem);
     return status;
 }
