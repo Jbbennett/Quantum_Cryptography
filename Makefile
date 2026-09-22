@@ -6,8 +6,8 @@ LDFLAGS += -L$(HOMEBREW_PREFIX)/lib
 LDLIBS += -loqs -lcrypto
 CFLAGS ?= -std=c11 -Wall -Wextra -Wpedantic -O2
 
-PROGRAMS := pqc_hybrid_encrypt pqc_lkem_hybrid_encrypt
-LKEM_PROGRAM := pqc_lkem_hybrid_encrypt
+PROGRAMS := pqc_mlkem_AES pqc_lkem_AES
+LKEM_PROGRAM := pqc_lkem_AES
 INPUT_PACKET ?= TLSv1.3_packet.pcapng
 ENCODED_PACKET ?= encoded_packet.bin
 DECODED_PACKET ?= decoded_packet.pcapng
@@ -18,30 +18,30 @@ LKEM_DECODED_PACKET ?= decoded_packet_lkem.pcapng
 
 all: $(PROGRAMS)
 
-pqc_hybrid_encrypt: pqc_hybrid_encrypt.c
+pqc_mlkem_AES: pqc_mlkem_AES.c
 	$(CC) $(CPPFLAGS) $(CFLAGS) $< $(LDFLAGS) $(LDLIBS) -o $@
 
-pqc_lkem_hybrid_encrypt: pqc_lkem_hybrid_encrypt.c
+pqc_lkem_AES: pqc_lkem_AES.c
 	$(CC) $(CPPFLAGS) $(CFLAGS) $< $(LDFLAGS) $(LDLIBS) -o $@
 
-hybrid: pqc_hybrid_encrypt
-	./pqc_hybrid_encrypt $(INPUT_PACKET) $(ENCODED_PACKET) $(DECODED_PACKET)
+mlkem: pqc_mlkem_AES
+	./pqc_mlkem_AES $(INPUT_PACKET) $(ENCODED_PACKET) $(DECODED_PACKET)
 
 lkem: $(LKEM_PROGRAM)
-	./pqc_lkem_hybrid_encrypt $(INPUT_PACKET) $(LKEM_ENCODED_PACKET) $(LKEM_DECODED_PACKET)
+	./pqc_lkem_AES $(INPUT_PACKET) $(LKEM_ENCODED_PACKET) $(LKEM_DECODED_PACKET)
 
-run: hybrid
+run: mlkem lkem
 
 lkem-run: lkem
 
-compare: pqc_hybrid_encrypt pqc_lkem_hybrid_encrypt
+compare: pqc_mlkem_AES pqc_lkem_AES
 	@echo "=== ML-KEM vs LKEM comparison ==="
 	@mlkem_start=$$(date +%s%N); \
-	./pqc_hybrid_encrypt $(INPUT_PACKET) $(ENCODED_PACKET) $(DECODED_PACKET) > /tmp/mlkem_compare.out 2>&1; \
+	./pqc_mlkem_AES $(INPUT_PACKET) $(ENCODED_PACKET) $(DECODED_PACKET) > /tmp/mlkem_compare.out 2>&1; \
 	mlkem_end=$$(date +%s%N); \
 	mlkem_time=$$(( (mlkem_end - mlkem_start) / 1000000 )); \
 	lkem_start=$$(date +%s%N); \
-	./pqc_lkem_hybrid_encrypt $(INPUT_PACKET) $(LKEM_ENCODED_PACKET) $(LKEM_DECODED_PACKET) > /tmp/lkem_compare.out 2>&1; \
+	./pqc_lkem_AES $(INPUT_PACKET) $(LKEM_ENCODED_PACKET) $(LKEM_DECODED_PACKET) > /tmp/lkem_compare.out 2>&1; \
 	lkem_end=$$(date +%s%N); \
 	lkem_time=$$(( (lkem_end - lkem_start) / 1000000 )); \
 	mlkem_pk=$$(grep 'Public key length:' /tmp/mlkem_compare.out | awk '{print $$4}'); \
@@ -85,11 +85,13 @@ compare: pqc_hybrid_encrypt pqc_lkem_hybrid_encrypt
 	if [ "$$mlkem_ss" -eq "$$lkem_ss" ]; then echo "  Shared secret size: similar"; else echo "  Shared secret size: different"; fi; \
 	if [ "$$mlkem_time" -lt "$$lkem_time" ]; then echo "  Winner: ML-KEM"; else echo "  Winner: LKEM"; fi; \
 	echo "  Practical interpretation: both are in the same rough security class, but ML-KEM is the better overall choice for this deployment because it is smaller, faster, and more efficient in bandwidth and implementation footprint."
-test: pqc_hybrid_encrypt
-	./pqc_hybrid_encrypt --self-test
+mlkem-test: pqc_mlkem_AES
+	./pqc_mlkem_AES --self-test
 
 lkem-test: $(LKEM_PROGRAM)
-	./pqc_lkem_hybrid_encrypt --self-test
+	./pqc_lkem_AES --self-test
+
+test-all: mlkem-test lkem-test
 
 clean:
 	rm -f $(PROGRAMS)
