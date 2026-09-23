@@ -9,10 +9,12 @@ CFLAGS ?= -std=c11 -Wall -Wextra -Wpedantic -O2
 PROGRAMS := pqc_mlkem_AES pqc_lkem_AES
 LKEM_PROGRAM := pqc_lkem_AES
 INPUT_PACKET ?= TLSv1.3_packet.pcapng
-ENCODED_PACKET ?= encoded_packet.bin
-DECODED_PACKET ?= decoded_packet.pcapng
-LKEM_ENCODED_PACKET ?= encoded_packet_lkem.bin
-LKEM_DECODED_PACKET ?= decoded_packet_lkem.pcapng
+MLKEM_OUTPUT_DIR ?= mlkem_output
+LKEM_OUTPUT_DIR ?= lkem_output
+ENCODED_PACKET ?= $(MLKEM_OUTPUT_DIR)/encoded_packet_mlkem.bin
+DECODED_PACKET ?= $(MLKEM_OUTPUT_DIR)/decoded_packet_mlkem.pcapng
+LKEM_ENCODED_PACKET ?= $(LKEM_OUTPUT_DIR)/encoded_packet_lkem.bin
+LKEM_DECODED_PACKET ?= $(LKEM_OUTPUT_DIR)/decoded_packet_lkem.pcapng
 
 .PHONY: all clean test hybrid run lkem lkem-test compare
 
@@ -25,9 +27,11 @@ pqc_lkem_AES: pqc_lkem_AES.c
 	$(CC) $(CPPFLAGS) $(CFLAGS) $< $(LDFLAGS) $(LDLIBS) -o $@
 
 mlkem: pqc_mlkem_AES
+	mkdir -p "$(MLKEM_OUTPUT_DIR)"
 	./pqc_mlkem_AES $(INPUT_PACKET) $(ENCODED_PACKET) $(DECODED_PACKET)
 
 lkem: $(LKEM_PROGRAM)
+	mkdir -p "$(LKEM_OUTPUT_DIR)"
 	./pqc_lkem_AES $(INPUT_PACKET) $(LKEM_ENCODED_PACKET) $(LKEM_DECODED_PACKET)
 
 run: mlkem lkem
@@ -35,6 +39,7 @@ run: mlkem lkem
 lkem-run: lkem
 
 compare: pqc_mlkem_AES pqc_lkem_AES
+	mkdir -p "$(MLKEM_OUTPUT_DIR)" "$(LKEM_OUTPUT_DIR)"
 	@echo "=== ML-KEM vs LKEM comparison ==="
 	@mlkem_start=$$(date +%s%N); \
 	./pqc_mlkem_AES $(INPUT_PACKET) $(ENCODED_PACKET) $(DECODED_PACKET) > /tmp/mlkem_compare.out 2>&1; \
